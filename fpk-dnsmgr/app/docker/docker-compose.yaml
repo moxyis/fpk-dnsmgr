@@ -1,0 +1,13 @@
+version: "3.8"
+
+services:
+  dnsmgr-web:
+    container_name: dnsmgr-web
+    restart: always
+    stdin_open: true
+    tty: true
+    ports:
+      - "${app_port}:80"
+    volumes:
+      - "/${TRIM_APPDEST_VOL}/@appshare/${TRIM_APPNAME}/web:/app/www"
+    image: netcccyun/dnsmgr

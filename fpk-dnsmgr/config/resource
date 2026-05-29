@@ -1,0 +1,38 @@
+{
+    "docker-project":
+    {
+        "projects":
+        [
+            {
+                "name": "fpk-dnsmgr",
+                "path": "docker"
+            }
+        ]
+    },
+    "data-share":
+    {
+        "shares":
+        [
+            {
+                "name": "fpk-dnsmgr",
+                "permission":
+                {
+                    "rw":
+                    [
+                        "docker-fpk-dnsmgr"
+                    ]
+                }
+            },
+            {
+                "name": "fpk-dnsmgr/data",
+                "permission":
+                {
+                    "rw":
+                    [
+                        "docker-fpk-dnsmgr"
+                    ]
+                }
+            }
+        ]
+    }
+}
