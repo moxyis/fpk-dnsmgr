@@ -97,7 +97,7 @@ jobs:
           curl -L "$FNPACK_URL" -o /tmp/fnpack
           chmod +x /tmp/fnpack
           sudo mv /tmp/fnpack /usr/local/bin/fnpack
-          fnpack --version
+          fnpack --help
 
       - name: 更新 manifest platform 为 all
         if: steps.compare.outputs.need_update == 'true'
