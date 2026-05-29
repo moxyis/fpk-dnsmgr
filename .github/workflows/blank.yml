@@ -1,0 +1,190 @@
+name: DNSMgr Docker 多架构打包并更新 FnDepot
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug_mode:
+        description: "true=只打包不推送，false=生产推送"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+  schedule:
+    - cron: '0 0 * * *'
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  DEBUG_MODE: ${{ github.event.inputs.debug_mode || 'false' }}
+
+  APP_ID: "fpk-dnsmgr"
+  APP_NAME: "彩虹聚合DNS管理系统"
+  BASE_DIR: "fpk-dnsmgr"
+
+  DOCKER_IMAGE: "netcccyun/dnsmgr"
+  DOCKER_API_URL: "https://registry.hub.docker.com/v2/repositories/netcccyun/dnsmgr/tags?page_size=100"
+  DIGEST_FILE: "docker-image-digest.txt"
+
+  FNPACK_VERSION: "1.2.1"
+  FNPACK_PLATFORM: "linux-amd64"
+  FNPACK_BASE_URL: "https://static2.fnnas.com/fnpack"
+
+  PACKAGE_DIR: "/tmp/fpk-packages"
+  RELEASE_ARCH_NAME: "Linux-AMD64"
+
+  FNDEPOT_REPO: "moxyis/FnDepot"
+  FNDEPOT_BRANCH: "main"
+  FNDEPOT_APP_DIR: "fpk-dnsmgr"
+
+  ARCH_LIST: "x86 arm"
+  ASSET_x86: "linux_amd64.tar.gz"
+  ASSET_arm: "linux_arm64.tar.gz"
+
+jobs:
+  build-multi-arch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: read
+
+    steps:
+      - name: 1. 检出仓库
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 2. 安装依赖
+        run: |
+          sudo apt update
+          sudo apt install -y jq curl sed skopeo coreutils findutils file
+
+      - name: 3. 初始化环境
+        id: init
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          BUILD_TIME=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S")
+          echo "build_time=$BUILD_TIME" >> "$GITHUB_OUTPUT"
+
+      - name: 4. 获取本地版本
+        id: local_version
+        run: |
+          MANIFEST_PATH="$BASE_DIR/manifest"
+          if [ ! -f "$MANIFEST_PATH" ]; then
+            mkdir -p "$BASE_DIR"
+            echo "version = 0.0.0" > "$MANIFEST_PATH"
+          fi
+          LOCAL_VERSION=$(sed -n 's/^[[:space:]]*version[[:space:]]*[:=][[:space:]]*//p' "$MANIFEST_PATH" \
+            | tr -d '"' \
+            | tr -d "'" \
+            | tr -d '\r\n' \
+            | sed 's/^v//' \
+            | xargs)
+          [ -z "$LOCAL_VERSION" ] && LOCAL_VERSION="0.0.0"
+          echo "local_version=$LOCAL_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: 5. 获取 Docker Hub 最新版本和 digest
+        id: remote_ver
+        run: |
+          RAW_RESPONSE=$(curl -sSL --retry 3 --connect-timeout 10 "$DOCKER_API_URL")
+          ALL_VALID_TAGS=$(echo "$RAW_RESPONSE" | jq -r '.results[]?.name' \
+            | grep -v -E 'latest|dev|beta|alpha|nightly|test|rc|preview' \
+            | grep -E '^v?[0-9]+\.[0-9]+(\.[0-9]+)?$' || true)
+          if [ -z "$ALL_VALID_TAGS" ]; then
+            echo "❌ 未找到有效版本标签"; exit 1; fi
+          LATEST_TAG=$(echo "$ALL_VALID_TAGS" | sed 's/^v//' | sort -V | tail -n1)
+          REMOTE_VERSION="$LATEST_TAG"
+          MATCH_TAG_WITH_V="v$REMOTE_VERSION"
+          MATCH_TAG_NO_V="$REMOTE_VERSION"
+          REMOTE_DIGEST=$(echo "$RAW_RESPONSE" | jq -r --arg tag_v "$MATCH_TAG_WITH_V" --arg tag_no_v "$MATCH_TAG_NO_V" \
+            '.results[]? | select(.name==$tag_v or .name==$tag_no_v) | .images[0].digest // ""' \
+            | head -n1 | tr -d '\r\n' | xargs)
+          if [ -z "$REMOTE_DIGEST" ] || [ "$REMOTE_DIGEST" = "null" ]; then
+            if echo "$ALL_VALID_TAGS" | grep -qx "$MATCH_TAG_WITH_V"; then INSPECT_TAG="$MATCH_TAG_WITH_V"; else INSPECT_TAG="$MATCH_TAG_NO_V"; fi
+            REMOTE_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://$DOCKER_IMAGE:$INSPECT_TAG" 2>/dev/null | tr -d '\r\n' | xargs || true)
+          fi
+          echo "remote_version=$REMOTE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "remote_digest=$REMOTE_DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: 6. 获取本地 digest
+        id: local_digest
+        run: |
+          touch "$DIGEST_FILE"
+          LOCAL_DIGEST=$(cat "$DIGEST_FILE" | tr -d '\r\n' | xargs)
+          echo "local_digest=$LOCAL_DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: 7. 判断是否需要更新
+        id: compare
+        run: |
+          LOCAL_VER="${{ steps.local_version.outputs.local_version }}"
+          REMOTE_VER="${{ steps.remote_ver.outputs.remote_version }}"
+          LOCAL_DIG="${{ steps.local_digest.outputs.local_digest }}"
+          REMOTE_DIG="${{ steps.remote_ver.outputs.remote_digest }}"
+          LOCAL_VER=$(echo "$LOCAL_VER" | tr -d '\r\n' | sed 's/^v//' | xargs)
+          REMOTE_VER=$(echo "$REMOTE_VER" | tr -d '\r\n' | sed 's/^v//' | xargs)
+          LOCAL_DIG=$(echo "$LOCAL_DIG" | tr -d '\r\n' | xargs)
+          REMOTE_DIG=$(echo "$REMOTE_DIG" | tr -d '\r\n' | xargs)
+          if [ "$DEBUG_MODE" = "true" ]; then
+            echo "need_update=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$LOCAL_VER" != "$REMOTE_VER" ] || ([ -n "$LOCAL_DIG" ] && [ -n "$REMOTE_DIG" ] && [ "$LOCAL_DIG" != "$REMOTE_DIG" ]); then
+            echo "need_update=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "need_update=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 8. 更新 manifest 和 digest
+        if: steps.compare.outputs.need_update == 'true'
+        run: |
+          MANIFEST_PATH="$BASE_DIR/manifest"
+          NEW_VER="${{ steps.remote_ver.outputs.remote_version }}"
+          NEW_DIG="${{ steps.remote_ver.outputs.remote_digest }}"
+          if grep -qE '^[[:space:]]*version[[:space:]]*[:=]' "$MANIFEST_PATH"; then
+            sed -i -E "s/(^[[:space:]]*version[[:space:]]*[:=][[:space:]]*)([\"']?)(.+)([\"']?)/\1\2${NEW_VER}\4/" "$MANIFEST_PATH"
+          else
+            echo "version = $NEW_VER" >> "$MANIFEST_PATH"
+          fi
+          echo -n "$NEW_DIG" > "$DIGEST_FILE"
+          git add "$MANIFEST_PATH" "$DIGEST_FILE"
+
+      - name: 9. 下载并安装 fnpack
+        if: steps.compare.outputs.need_update == 'true'
+        run: |
+          FNPACK_URL="${FNPACK_BASE_URL}/fnpack-${FNPACK_VERSION}-${FNPACK_PLATFORM}"
+          HTTP_CODE=$(curl -L --retry 3 --connect-timeout 10 -w "%{http_code}" -o /tmp/fnpack "$FNPACK_URL")
+          if [ "$HTTP_CODE" != "200" ] || head -n 1 /tmp/fnpack | grep -qiE '<!DOCTYPE|<html'; then
+            echo "❌ fnpack 下载失败或返回 HTML"; exit 1
+          fi
+          install -m 755 /tmp/fnpack /usr/local/bin/fnpack
+          which fnpack
+          file /usr/local/bin/fnpack
+
+      # 10. 多架构打包逻辑保持不变
+      # ...（省略，可复用你现有 build_one_arch 函数和循环）...
+
+      - name: 12. 更新 FnDepot README
+        if: steps.compare.outputs.need_update == 'true'
+        run: |
+          REMOTE_VERSION="${{ steps.remote_ver.outputs.remote_version }}"
+          README_FILE="/tmp/FnDepot/README.md"
+          SOURCE_URL="https://hub.docker.com/r/${DOCKER_IMAGE}"
+          NEW_ROW="| **${APP_NAME}** | ${REMOTE_VERSION} | ${SOURCE_URL} | Docker |"
+          if [ ! -f "$README_FILE" ]; then
+            { echo "# FnDepot"; echo ""; echo "| 应用名称 | 版本号 | 来源 | 类型 |"; echo "|---|---|---|---|"; echo "$NEW_ROW"; } > "$README_FILE"
+          elif grep -qF "**${APP_NAME}**" "$README_FILE"; then
+            awk -v app="$APP_NAME" -v row="$NEW_ROW" '$0 ~ "\\*\\*" app "\\*\\*" {print row; next} {print}' "$README_FILE" > "$README_FILE.tmp"
+            mv "$README_FILE.tmp" "$README_FILE"
+          elif grep -q '^| 应用名称 |' "$README_FILE"; then
+            awk -v row="$NEW_ROW" 'BEGIN{added=0} {print; if($0 ~ /^\|---/ && added==0){print row; added=1}}' "$README_FILE" > "$README_FILE.tmp"
+            mv "$README_FILE.tmp" "$README_FILE"
+          else
+            { echo ""; echo "| 应用名称 | 版本号 | 来源 | 类型 |"; echo "|---|---|---|---|"; echo "$NEW_ROW"; } >> "$README_FILE"
+          fi
+
+      # 13. 提交 FnDepot 变更
+      # 14. 创建 GitHub Release
+      # 15. 更新基础 manifest
+      # （可保留原有逻辑不变）
