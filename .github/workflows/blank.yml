@@ -1,3 +1,4 @@
+
 name: 自动打包彩虹聚合DNS管理系统 Docker FPK 并更新仓库
 
 on:
@@ -12,7 +13,11 @@ on:
           - "true"
           - "false"
   schedule:
-    - cron: '0 0 * * *'
+    - cron: "0 0 * * *"
+
+concurrency:
+  group: dnsmgr-fpk-publish
+  cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -44,93 +49,140 @@ jobs:
       pull-requests: read
 
     steps:
-      - name: 检出仓库
-        uses: actions/checkout@v6
+      - name: 01. 检出仓库
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 安装依赖
+      - name: 02. 安装依赖
         run: |
-          sudo apt update
-          sudo apt install -y jq curl skopeo unzip file
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq curl skopeo unzip file
 
-      - name: 初始化环境
+      - name: 03. 初始化环境
         id: init
         run: |
+          set -euo pipefail
+
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          BUILD_TIME=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S")
+
+          BUILD_TIME=$(TZ="Asia/Shanghai" date "+%Y-%m-%d %H:%M:%S")
           echo "build_time=$BUILD_TIME" >> "$GITHUB_OUTPUT"
 
-      - name: 获取本地版本
+          echo "构建时间：$BUILD_TIME"
+          echo "应用：$APP_ID"
+          echo "模式：$DEBUG_MODE"
+
+      - name: 04. 获取本地版本
         id: local_ver
         run: |
+          set -euo pipefail
+
           MANIFEST="$BASE_DIR/manifest"
+
           if [ ! -f "$MANIFEST" ]; then
-            mkdir -p "$BASE_DIR"
-            echo "version = 0.0.0" > "$MANIFEST"
-            echo "platform = all" >> "$MANIFEST"
+            echo "❌ manifest 不存在：$MANIFEST"
+            exit 1
           fi
 
-          LOCAL_VERSION=$(sed -n 's/^[[:space:]]*version[[:space:]]*[:=][[:space:]]*//p' "$MANIFEST" \
-            | head -n1 \
-            | tr -d '"' \
-            | tr -d "'" \
-            | tr -d '\r\n' \
-            | sed 's/^v//' \
-            | xargs)
+          LOCAL_VERSION=$(
+            sed -n 's/^[[:space:]]*version[[:space:]]*[:=][[:space:]]*//p' "$MANIFEST" |
+            head -n 1 |
+            tr -d "\"'\r\n" |
+            sed 's/^v//' |
+            xargs
+          )
 
-          [ -z "$LOCAL_VERSION" ] && LOCAL_VERSION="0.0.0"
+          LOCAL_VERSION="${LOCAL_VERSION:-0.0.0}"
+
           echo "local_version=$LOCAL_VERSION" >> "$GITHUB_OUTPUT"
+          echo "本地版本：$LOCAL_VERSION"
 
-      - name: 获取 GitHub 最新版本
+      - name: 05. 获取 GitHub 最新版本
         id: remote_ver
         run: |
-          REMOTE_VERSION=$(curl -sSL -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/netcccyun/dnsmgr/releases/latest" \
-            | jq -r '.tag_name' \
-            | sed 's/^v//' \
-            | tr -d '\r\n' \
-            | xargs)
+          set -euo pipefail
 
-          if [ -z "$REMOTE_VERSION" ] || [ "$REMOTE_VERSION" = "null" ]; then
+          RESPONSE=$(curl -fsSL \
+            --retry 3 \
+            --connect-timeout 15 \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/netcccyun/dnsmgr/releases/latest")
+
+          REMOTE_VERSION=$(
+            echo "$RESPONSE" |
+            jq -r '.tag_name // empty' |
+            sed 's/^v//' |
+            tr -d '\r\n' |
+            xargs
+          )
+
+          if [ -z "$REMOTE_VERSION" ]; then
             echo "❌ 获取远程版本失败"
             exit 1
           fi
 
           echo "remote_version=$REMOTE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "远程版本：$REMOTE_VERSION"
 
-      - name: 判断是否需要更新
+      - name: 06. 判断是否需要更新
         id: compare
         run: |
+          set -euo pipefail
+
           LOCAL_VER="${{ steps.local_ver.outputs.local_version }}"
           REMOTE_VER="${{ steps.remote_ver.outputs.remote_version }}"
 
-          if [ "$LOCAL_VER" != "$REMOTE_VER" ] || [ "$DEBUG_MODE" = "true" ]; then
+          if [ "$DEBUG_MODE" = "true" ]; then
             echo "need_update=true" >> "$GITHUB_OUTPUT"
+            echo "Debug 模式：强制打包测试"
+          elif [ "$LOCAL_VER" != "$REMOTE_VER" ]; then
+            echo "need_update=true" >> "$GITHUB_OUTPUT"
+            echo "检测到新版本：$LOCAL_VER → $REMOTE_VER"
           else
             echo "need_update=false" >> "$GITHUB_OUTPUT"
+            echo "版本一致，无需更新"
           fi
 
-      - name: 下载并安装 fnpack
+      - name: 07. 下载并安装 fnpack
         if: steps.compare.outputs.need_update == 'true'
         run: |
+          set -euo pipefail
+
           FNPACK_URL="${FNPACK_BASE_URL}/fnpack-${FNPACK_VERSION}-${FNPACK_PLATFORM}"
-          curl -L "$FNPACK_URL" -o /tmp/fnpack
-          chmod +x /tmp/fnpack
-          sudo mv /tmp/fnpack /usr/local/bin/fnpack
+
+          curl -fL \
+            --retry 3 \
+            --connect-timeout 15 \
+            "$FNPACK_URL" \
+            -o /tmp/fnpack
+
+          test -s /tmp/fnpack
+
+          if head -c 256 /tmp/fnpack | grep -qiE '<!DOCTYPE|<html'; then
+            echo "❌ 下载内容不是 fnpack 二进制"
+            exit 1
+          fi
+
+          sudo install -m 755 /tmp/fnpack /usr/local/bin/fnpack
+
+          command -v fnpack
           fnpack --help
 
-      - name: 更新当前仓库 manifest 信息
+      - name: 08. 更新当前仓库 manifest 信息
         if: steps.compare.outputs.need_update == 'true'
         run: |
+          set -euo pipefail
+
           MANIFEST="$BASE_DIR/manifest"
           VERSION="${{ steps.remote_ver.outputs.remote_version }}"
 
           if grep -qE '^[[:space:]]*version[[:space:]]*[:=]' "$MANIFEST"; then
             sed -i -E \
-              "s/(^[[:space:]]*version[[:space:]]*[:=][[:space:]]*)([\"']?).*([\"']?)/\1\2${VERSION}\3/" \
+              "s|^[[:space:]]*version[[:space:]]*[:=].*|version = ${VERSION}|" \
               "$MANIFEST"
           else
             echo "version = $VERSION" >> "$MANIFEST"
@@ -138,80 +190,181 @@ jobs:
 
           if grep -qE '^[[:space:]]*platform[[:space:]]*[:=]' "$MANIFEST"; then
             sed -i -E \
-              "s/(^[[:space:]]*platform[[:space:]]*[:=][[:space:]]*)([\"']?).*([\"']?)/\1\2all\3/" \
+              's|^[[:space:]]*platform[[:space:]]*[:=].*|platform = all|' \
               "$MANIFEST"
           else
             echo "platform = all" >> "$MANIFEST"
           fi
 
+          echo "更新后的 manifest："
           grep -iE 'version|platform' "$MANIFEST"
 
-      - name: 执行 fnpack 打包
+      - name: 09. 执行 fnpack 打包
         if: steps.compare.outputs.need_update == 'true'
         id: build_fpk
         run: |
-          cd "$BASE_DIR"
-          fnpack build
+          set -euo pipefail
+
+          VERSION="${{ steps.remote_ver.outputs.remote_version }}"
 
           mkdir -p "$PACKAGE_DIR"
 
-          FPK_FILE=$(find . -name "*.fpk" -type f | head -n1)
+          cd "$BASE_DIR"
 
-          if [ -z "$FPK_FILE" ]; then
-            echo "❌ 未生成 fpk 文件"
+          # 避免误选上一次生成的 FPK
+          find . -type f -name "*.fpk" -delete
+
+          fnpack build
+
+          FPK_FILE=$(find . -type f -name "*.fpk" -print -quit)
+
+          if [ -z "$FPK_FILE" ] || [ ! -s "$FPK_FILE" ]; then
+            echo "❌ fnpack 未生成有效 FPK 文件"
+            find . -maxdepth 3 -type f
             exit 1
           fi
 
-          RELEASE_FILE="$PACKAGE_DIR/${APP_ID}-v${{ steps.remote_ver.outputs.remote_version }}-all.fpk"
+          RELEASE_FILE="$PACKAGE_DIR/${APP_ID}-v${VERSION}-all.fpk"
           BASE_FILE="$PACKAGE_DIR/${APP_ID}.fpk"
 
           cp "$FPK_FILE" "$RELEASE_FILE"
           cp "$FPK_FILE" "$BASE_FILE"
 
+          test -s "$RELEASE_FILE"
+          test -s "$BASE_FILE"
+
           echo "fpk_release_file=$RELEASE_FILE" >> "$GITHUB_OUTPUT"
           echo "fpk_base_file=$BASE_FILE" >> "$GITHUB_OUTPUT"
 
-      - name: 生产模式：提交当前仓库信息
-        if: steps.compare.outputs.need_update == 'true' && env.DEBUG_MODE == 'false'
-        run: |
-          git add "$BASE_DIR/manifest"
+          echo "✅ FPK 打包完成"
+          ls -lh "$RELEASE_FILE" "$BASE_FILE"
 
-          if git diff --cached --quiet; then
-            echo "✅ 当前仓库无变更，跳过提交"
-          else
-            git commit -m "chore: 更新 ${APP_NAME} 至 v${{ steps.remote_ver.outputs.remote_version }}"
-            git push origin HEAD:${{ github.ref_name }}
+      - name: 10. 生产模式：克隆 FnDepot
+        if: steps.compare.outputs.need_update == 'true' && env.DEBUG_MODE == 'false'
+        env:
+          FNDEPOT_TOKEN: ${{ secrets.FnDepot_PAT }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$FNDEPOT_TOKEN" ]; then
+            echo "❌ 缺少 FnDepot_PAT Secret"
+            exit 1
           fi
 
-      - name: 克隆 FnDepot
-        if: steps.compare.outputs.need_update == 'true' && env.DEBUG_MODE == 'false'
-        run: |
-          git clone "https://x-access-token:${{ secrets.FnDepot_PAT }}@github.com/${FNDEPOT_REPO}.git" /tmp/FnDepot
+          rm -rf /tmp/FnDepot
 
-      - name: 复制 FPK 到 FnDepot
-        if: steps.compare.outputs.need_update == 'true' && env.DEBUG_MODE == 'false'
-        run: |
-          mkdir -p "/tmp/FnDepot/$FNDEPOT_APP_DIR"
-          cp "${{ steps.build_fpk.outputs.fpk_base_file }}" "/tmp/FnDepot/$FNDEPOT_APP_DIR/"
+          AUTH_HEADER=$(printf 'x-access-token:%s' "$FNDEPOT_TOKEN" | base64 -w0)
 
-      - name: 更新 FnDepot fnpack.json
+          git -c "http.extraheader=AUTHORIZATION: basic $AUTH_HEADER" \
+            clone \
+            --branch "$FNDEPOT_BRANCH" \
+            "https://github.com/${FNDEPOT_REPO}.git" \
+            /tmp/FnDepot
+
+          test -d /tmp/FnDepot/.git
+          test -f /tmp/FnDepot/fnpack.json
+
+          echo "✅ FnDepot 克隆成功"
+
+      - name: 11. 生产模式：复制 FPK 到 FnDepot
         if: steps.compare.outputs.need_update == 'true' && env.DEBUG_MODE == 'false'
         run: |
+          set -euo pipefail
+
+          VERSION="${{ steps.remote_ver.outputs.remote_version }}"
+          SOURCE="${{ steps.build_fpk.outputs.fpk_base_file }}"
+          TARGET="/tmp/FnDepot/$FNDEPOT_APP_DIR"
+
+          if [ ! -s "$SOURCE" ]; then
+            echo "❌ FPK 文件不存在：$SOURCE"
+            exit 1
+          fi
+
+          test -d /tmp/FnDepot/.git
+
+          mkdir -p "$TARGET/versions"
+
+          # 固定文件名：兼容现有下载方式
+          cp "$SOURCE" "$TARGET/${APP_ID}.fpk"
+
+          # 独立版本文件：防止后续版本覆盖
+          VERSION_FILE="$TARGET/versions/${APP_ID}-v${VERSION}.fpk"
+          cp "$SOURCE" "$VERSION_FILE"
+
+          echo "✅ FPK 复制完成"
+          ls -lh "$TARGET/${APP_ID}.fpk" "$VERSION_FILE"
+
+      - name: 12. 生产模式：更新 FnDepot V2 应用源
+        if: steps.compare.outputs.need_update == 'true' && env.DEBUG_MODE == 'false'
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ steps.remote_ver.outputs.remote_version }}"
           JSON_FILE="/tmp/FnDepot/fnpack.json"
-          [ ! -f "$JSON_FILE" ] && echo '{}' > "$JSON_FILE"
+          FPK_FILE="/tmp/FnDepot/$FNDEPOT_APP_DIR/versions/${APP_ID}-v${VERSION}.fpk"
 
-          jq --arg app "$APP_ID" --arg ver "${{ steps.remote_ver.outputs.remote_version }}" \
-            '.[$app] = (.[$app] // {}) | .[$app].version = $ver' \
-            "$JSON_FILE" > "$JSON_FILE.tmp"
+          test -s "$FPK_FILE"
+          test -f "$JSON_FILE"
+
+          jq -e '
+            .schema_version == "2" and
+            (.apps | type == "object")
+          ' "$JSON_FILE" >/dev/null
+
+          jq -e --arg app "$APP_ID" '
+            .apps[$app] | type == "object"
+          ' "$JSON_FILE" >/dev/null
+
+          SIZE=$(stat -c%s "$FPK_FILE")
+          SHA256=$(sha256sum "$FPK_FILE" | awk '{print $1}')
+          URL="./${APP_ID}/versions/${APP_ID}-v${VERSION}.fpk"
+
+          jq \
+            --arg app "$APP_ID" \
+            --arg ver "$VERSION" \
+            --arg url "$URL" \
+            --arg sha "$SHA256" \
+            --argjson size "$SIZE" \
+            '
+            .apps[$app].releases = (.apps[$app].releases // {}) |
+            .apps[$app].releases[$ver] =
+              ((.apps[$app].releases[$ver] // {}) + {
+                "changelog": ("自动构建更新至 " + $ver),
+                "packages": {
+                  "all": {
+                    "download_url": $url,
+                    "size": $size,
+                    "sha256": $sha
+                  }
+                }
+              })
+            ' "$JSON_FILE" > "$JSON_FILE.tmp"
+
+          jq -e --arg app "$APP_ID" --arg ver "$VERSION" '
+            .schema_version == "2" and
+            (.apps[$app].releases[$ver].packages.all.download_url | type == "string") and
+            (.apps[$app].releases[$ver].packages.all.size > 0) and
+            (.apps[$app].releases[$ver].packages.all.sha256 | length == 64)
+          ' "$JSON_FILE.tmp" >/dev/null
 
           mv "$JSON_FILE.tmp" "$JSON_FILE"
 
-      - name: 更新 FnDepot README
+          echo "✅ FnDepot V2 更新成功"
+          echo "应用：$APP_ID"
+          echo "版本：$VERSION"
+          echo "大小：$SIZE 字节"
+          echo "SHA256：$SHA256"
+          echo "下载地址：$URL"
+
+      - name: 13. 生产模式：更新 FnDepot README
         if: steps.compare.outputs.need_update == 'true' && env.DEBUG_MODE == 'false'
         run: |
+          set -euo pipefail
+
           README_FILE="/tmp/FnDepot/README.md"
-          SOURCE_URL="https://github.com/netcccyun/dnsmgr/releases/tag/v${{ steps.remote_ver.outputs.remote_version }}"
-          NEW_ROW="| **${APP_NAME}** | ${{ steps.remote_ver.outputs.remote_version }} | ${SOURCE_URL} | GitHub |"
+          VERSION="${{ steps.remote_ver.outputs.remote_version }}"
+          SOURCE_URL="https://github.com/netcccyun/dnsmgr/releases/tag/v${VERSION}"
+          NEW_ROW="| **${APP_NAME}** | ${VERSION} | ${SOURCE_URL} | GitHub |"
 
           if [ ! -f "$README_FILE" ]; then
             {
@@ -221,12 +374,18 @@ jobs:
               echo "|---|---|---|---|"
               echo "$NEW_ROW"
             } > "$README_FILE"
+
           elif grep -qF "**${APP_NAME}**" "$README_FILE"; then
             awk -v app="$APP_NAME" -v row="$NEW_ROW" '
-              $0 ~ "\\*\\*" app "\\*\\*" { print row; next }
+              index($0, "**" app "**") {
+                print row
+                next
+              }
               { print }
             ' "$README_FILE" > "$README_FILE.tmp"
+
             mv "$README_FILE.tmp" "$README_FILE"
+
           elif grep -q '^| 应用名称 |' "$README_FILE"; then
             awk -v row="$NEW_ROW" '
               BEGIN { added=0 }
@@ -238,7 +397,9 @@ jobs:
                 }
               }
             ' "$README_FILE" > "$README_FILE.tmp"
+
             mv "$README_FILE.tmp" "$README_FILE"
+
           else
             {
               echo ""
@@ -248,23 +409,53 @@ jobs:
             } >> "$README_FILE"
           fi
 
-      - name: 提交 FnDepot 变更
+          echo "✅ README 更新完成"
+
+      - name: 14. 生产模式：提交 FnDepot 变更
         if: steps.compare.outputs.need_update == 'true' && env.DEBUG_MODE == 'false'
+        env:
+          FNDEPOT_TOKEN: ${{ secrets.FnDepot_PAT }}
         run: |
+          set -euo pipefail
+
           cd /tmp/FnDepot
+
           git add "$FNDEPOT_APP_DIR/" fnpack.json README.md
 
           if git diff --cached --quiet; then
-            echo "✅ FnDepot 无变更，跳过提交"
-          else
-            git commit -m "chore: 更新 ${APP_NAME} v${{ steps.remote_ver.outputs.remote_version }}"
-            git remote set-url origin "https://x-access-token:${{ secrets.FnDepot_PAT }}@github.com/${FNDEPOT_REPO}.git"
-            git push origin "$FNDEPOT_BRANCH"
+            echo "FnDepot 无变更，跳过提交"
+            exit 0
           fi
 
-      - name: 创建当前仓库 Release
+          git commit -m "chore: 更新 ${APP_NAME} v${{ steps.remote_ver.outputs.remote_version }}"
+
+          AUTH_HEADER=$(printf 'x-access-token:%s' "$FNDEPOT_TOKEN" | base64 -w0)
+
+          git -c "http.extraheader=AUTHORIZATION: basic $AUTH_HEADER" \
+            push origin "HEAD:${FNDEPOT_BRANCH}"
+
+          echo "✅ FnDepot 推送成功"
+
+      - name: 15. 生产模式：提交当前仓库 manifest
         if: steps.compare.outputs.need_update == 'true' && env.DEBUG_MODE == 'false'
-        uses: softprops/action-gh-release@v3
+        run: |
+          set -euo pipefail
+
+          git add "$BASE_DIR/manifest"
+
+          if git diff --cached --quiet; then
+            echo "当前仓库无变更，跳过提交"
+            exit 0
+          fi
+
+          git commit -m "chore: 更新 ${APP_NAME} 至 v${{ steps.remote_ver.outputs.remote_version }}"
+          git push origin "HEAD:${{ github.ref_name }}"
+
+          echo "✅ 当前仓库 manifest 提交成功"
+
+      - name: 16. 生产模式：创建当前仓库 Release
+        if: steps.compare.outputs.need_update == 'true' && env.DEBUG_MODE == 'false'
+        uses: softprops/action-gh-release@v2
         with:
           overwrite_files: true
           tag_name: "v${{ steps.remote_ver.outputs.remote_version }}-all"
